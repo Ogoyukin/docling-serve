@@ -19,6 +19,7 @@ from docling_jobkit.datamodel.task_targets import (
 )
 
 from docling_serve.datamodel.convert import ConvertDocumentsRequestOptions
+from docling_serve.datamodel.webhook import WebhookOverride
 from docling_serve.settings import AsyncEngine, docling_serve_settings
 
 ## Sources
@@ -53,8 +54,26 @@ TargetRequest = Annotated[
 ]
 
 
+class WebhookRequestMixin(BaseModel):
+    webhook: WebhookOverride | None = Field(
+        default=None,
+        description=(
+            "Optional webhook override containing a callback URL and secret for this task."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_webhook_override(self) -> Self:
+        if self.webhook is not None:
+            self.webhook.validate_against(
+                allowed_hosts=docling_serve_settings.webhook_allowed_hosts,
+                allowed_schemes=docling_serve_settings.webhook_allowed_schemes,
+            )
+        return self
+
+
 ## Complete Source request
-class ConvertDocumentsRequest(BaseModel):
+class ConvertDocumentsRequest(WebhookRequestMixin, BaseModel):
     options: ConvertDocumentsRequestOptions = ConvertDocumentsRequestOptions()
     sources: list[SourceRequestItem]
     target: TargetRequest = InBodyTarget()
@@ -84,7 +103,7 @@ class ConvertDocumentsRequest(BaseModel):
 ## Source chunking requests
 
 
-class BaseChunkDocumentsRequest(BaseModel):
+class BaseChunkDocumentsRequest(WebhookRequestMixin, BaseModel):
     convert_options: Annotated[
         ConvertDocumentsRequestOptions, Field(description="Conversion options.")
     ] = ConvertDocumentsRequestOptions()

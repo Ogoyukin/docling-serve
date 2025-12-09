@@ -28,6 +28,7 @@ from fastapi.openapi.docs import (
 )
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import AnyHttpUrl
 from scalar_fastapi import get_scalar_api_reference
 
 from docling.datamodel.base_models import DocumentStream
@@ -66,6 +67,7 @@ from docling_serve.datamodel.requests import (
     TargetRequest,
     make_request_model,
 )
+from docling_serve.datamodel.webhook import WebhookConfig, WebhookOverride
 from docling_serve.datamodel.responses import (
     ChunkDocumentResponse,
     ClearResponse,
@@ -266,9 +268,46 @@ def create_app():  # noqa: C901
     # Async / Sync helpers #
     ########################
 
+    def _resolve_webhook_config(
+        webhook_override: WebhookOverride | None,
+    ) -> WebhookConfig | None:
+        base_config = docling_serve_settings.webhook
+        webhook_url = webhook_override.url if webhook_override else base_config.url
+        if webhook_url is None:
+            return None
+
+        secret = (
+            webhook_override.secret
+            if webhook_override and webhook_override.secret is not None
+            else base_config.secret
+        )
+
+        return WebhookConfig(
+            url=webhook_url,
+            method=base_config.method,
+            secret=secret,
+            headers=dict(base_config.headers),
+            max_retries=base_config.max_retries,
+            backoff_factor=base_config.backoff_factor,
+        )
+
+    def _build_webhook_override(
+        webhook_url: AnyHttpUrl | None, webhook_secret: str | None
+    ) -> WebhookOverride | None:
+        if webhook_url is None:
+            return None
+
+        override = WebhookOverride(url=webhook_url, secret=webhook_secret)
+        override.validate_against(
+            allowed_hosts=docling_serve_settings.webhook_allowed_hosts,
+            allowed_schemes=docling_serve_settings.webhook_allowed_schemes,
+        )
+        return override
+
     async def _enque_source(
         orchestrator: BaseOrchestrator,
         request: ConvertDocumentsRequest | GenericChunkDocumentsRequest,
+        webhook_override: WebhookOverride | None = None,
     ) -> Task:
         sources: list[TaskSource] = []
         for s in request.sources:
@@ -303,6 +342,7 @@ def create_app():  # noqa: C901
             chunking_options=chunking_options,
             chunking_export_options=chunking_export_options,
             target=request.target,
+            webhook_config=_resolve_webhook_config(webhook_override),
         )
         return task
 
@@ -314,6 +354,7 @@ def create_app():  # noqa: C901
         chunking_options: BaseChunkerOptions | None,
         chunking_export_options: ChunkingExportOptions | None,
         target: TargetRequest,
+        webhook_override: WebhookOverride | None = None,
     ) -> Task:
         _log.info(f"Received {len(files)} files for processing.")
 
@@ -332,6 +373,7 @@ def create_app():  # noqa: C901
             chunking_options=chunking_options,
             chunking_export_options=chunking_export_options,
             target=target,
+            webhook_config=_resolve_webhook_config(webhook_override),
         )
         return task
 
@@ -466,7 +508,9 @@ def create_app():  # noqa: C901
         conversion_request: ConvertDocumentsRequest,
     ):
         task = await _enque_source(
-            orchestrator=orchestrator, request=conversion_request
+            orchestrator=orchestrator,
+            request=conversion_request,
+            webhook_override=conversion_request.webhook,
         )
         completed = await _wait_task_complete(
             orchestrator=orchestrator, task_id=task.task_id
@@ -561,7 +605,9 @@ def create_app():  # noqa: C901
         conversion_request: ConvertDocumentsRequest,
     ):
         task = await _enque_source(
-            orchestrator=orchestrator, request=conversion_request
+            orchestrator=orchestrator,
+            request=conversion_request,
+            webhook_override=conversion_request.webhook,
         )
         task_queue_position = await orchestrator.get_queue_position(
             task_id=task.task_id
@@ -589,8 +635,11 @@ def create_app():  # noqa: C901
             ConvertDocumentsRequestOptions, FormDepends(ConvertDocumentsRequestOptions)
         ],
         target_type: Annotated[TargetName, Form()] = TargetName.INBODY,
+        webhook_url: Annotated[AnyHttpUrl | None, Form(default=None)] = None,
+        webhook_secret: Annotated[str | None, Form(default=None)] = None,
     ):
         target = InBodyTarget() if target_type == TargetName.INBODY else ZipTarget()
+        webhook_override = _build_webhook_override(webhook_url, webhook_secret)
         task = await _enque_file(
             task_type=TaskType.CONVERT,
             orchestrator=orchestrator,
@@ -599,6 +648,7 @@ def create_app():  # noqa: C901
             chunking_options=None,
             chunking_export_options=None,
             target=target,
+            webhook_override=webhook_override,
         )
         task_queue_position = await orchestrator.get_queue_position(
             task_id=task.task_id
@@ -630,7 +680,11 @@ def create_app():  # noqa: C901
             orchestrator: Annotated[BaseOrchestrator, Depends(get_async_orchestrator)],
             request: req_cls,
         ):
-            task = await _enque_source(orchestrator=orchestrator, request=request)
+            task = await _enque_source(
+                orchestrator=orchestrator,
+                request=request,
+                webhook_override=request.webhook,
+            )
             task_queue_position = await orchestrator.get_queue_position(
                 task_id=task.task_id
             )
@@ -681,8 +735,11 @@ def create_app():  # noqa: C901
                 TargetName,
                 Form(description="Specification for the type of output target."),
             ] = TargetName.INBODY,
+            webhook_url: Annotated[AnyHttpUrl | None, Form(default=None)] = None,
+            webhook_secret: Annotated[str | None, Form(default=None)] = None,
         ):
             target = InBodyTarget() if target_type == TargetName.INBODY else ZipTarget()
+            webhook_override = _build_webhook_override(webhook_url, webhook_secret)
             task = await _enque_file(
                 task_type=TaskType.CHUNK,
                 orchestrator=orchestrator,
@@ -693,6 +750,7 @@ def create_app():  # noqa: C901
                     include_converted_doc=include_converted_doc
                 ),
                 target=target,
+                webhook_override=webhook_override,
             )
             task_queue_position = await orchestrator.get_queue_position(
                 task_id=task.task_id
@@ -723,7 +781,11 @@ def create_app():  # noqa: C901
             orchestrator: Annotated[BaseOrchestrator, Depends(get_async_orchestrator)],
             request: req_cls,
         ):
-            task = await _enque_source(orchestrator=orchestrator, request=request)
+            task = await _enque_source(
+                orchestrator=orchestrator,
+                request=request,
+                webhook_override=request.webhook,
+            )
             completed = await _wait_task_complete(
                 orchestrator=orchestrator, task_id=task.task_id
             )

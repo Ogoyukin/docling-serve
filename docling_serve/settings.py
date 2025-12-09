@@ -3,9 +3,11 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-from pydantic import AnyUrl, model_validator
+from pydantic import AnyUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Self
+
+from docling_serve.datamodel.webhook import WebhookConfig, validate_webhook_url
 
 
 class UvicornSettings(BaseSettings):
@@ -90,6 +92,16 @@ class DoclingServeSettings(BaseSettings):
 
     eng_kfp_experimental: bool = False
 
+    webhook_allowed_hosts: list[str] = []
+    webhook_allowed_schemes: list[str] = ["https", "http"]
+    webhook: WebhookConfig = Field(
+        default_factory=WebhookConfig,
+        description=(
+            "Default webhook configuration applied to asynchronous tasks when"
+            " no per-task override is provided."
+        ),
+    )
+
     @model_validator(mode="after")
     def engine_settings(self) -> Self:
         # Validate KFP engine settings
@@ -106,6 +118,13 @@ class DoclingServeSettings(BaseSettings):
         if self.eng_kind == AsyncEngine.RQ:
             if not self.eng_rq_redis_url:
                 raise ValueError("RQ Redis url is required when using the RQ engine.")
+
+        if self.webhook.url is not None:
+            validate_webhook_url(
+                url=self.webhook.url,
+                allowed_hosts=self.webhook_allowed_hosts,
+                allowed_schemes=self.webhook_allowed_schemes,
+            )
 
         return self
 
