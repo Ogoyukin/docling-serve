@@ -499,6 +499,109 @@ with connect(uri) as websocket:
 
 </details>
 
+### Webhook callbacks
+
+If you prefer Docling Serve to push status updates, you can provide a webhook configuration in the asynchronous request body.
+
+- Set `webhook_url` to an **HTTPS** endpoint your service owns.
+- Optionally set `webhook_secret` to a string used to sign the callbacks.
+
+Example request fragment:
+
+```jsonc
+{
+  "options": { /* conversion options */ },
+  "http_sources": [{ "url": "https://example.com/doc.pdf" }],
+  "webhook_url": "https://listener.example.com/docling/callback",
+  "webhook_secret": "<strong-random-secret>"
+}
+```
+
+#### Payload format
+
+Webhook requests use `application/json` and include the latest task state:
+
+```jsonc
+{
+  "task_id": "<task_id>",
+  "task_status": "pending|started|success|failure",
+  "task_meta": { /* optional job metadata */ },
+  "task_position": 1,
+  "timestamp": "2024-06-21T12:34:56Z"
+}
+```
+
+#### Signature computation
+
+When `webhook_secret` is set, Docling Serve adds the `X-Docling-Signature` header computed as:
+
+```
+X-Docling-Signature: sha256=<hex(HMAC_SHA256(webhook_secret, body_bytes))>
+```
+
+To verify, recompute the HMAC of the raw request body with the shared secret and compare the constant-time result to the header value. Reject callbacks that:
+
+- arrive over plain HTTP,
+- have missing/invalid signatures, or
+- are older than your accepted timestamp window.
+
+#### Security recommendations
+
+- **Use HTTPS only** for `webhook_url`.
+- **Rotate secrets** periodically and support overlapping secrets during cutover.
+- **Make handlers idempotent** so repeated callbacks (e.g., retries) do not create duplicate work.
+- Return non-2xx responses on verification failure to signal retries.
+
+#### Consuming callbacks with polling fallback
+
+The snippet below shows how to consume webhook callbacks while still falling back to polling if no callback is received within a timeout:
+
+```python
+import hmac
+import hashlib
+import httpx
+import json
+import threading
+import time
+
+base_url = "http://localhost:5001"
+secret = b"<strong-random-secret>"
+task = {"task_id": "<task_id>"}
+received = {}
+
+def verify_signature(raw_body: bytes, signature: str) -> bool:
+    expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature.removeprefix("sha256="), expected)
+
+def handle_webhook(raw_body: bytes, headers: dict):
+    signature = headers.get("X-Docling-Signature", "")
+    if not verify_signature(raw_body, signature):
+        return False  # reject to trigger retry
+    payload = json.loads(raw_body)
+    received.update(payload)
+    return True
+
+def poll_until_complete(task_id: str, timeout: float = 30.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        response = httpx.get(f"{base_url}/v1/status/poll/{task_id}")
+        payload = response.json()
+        if payload.get("task_status") in {"success", "failure"}:
+            received.update(payload)
+            break
+        time.sleep(5)
+
+# In your web framework, call handle_webhook(request.body, request.headers)
+# For illustration, we simulate waiting for webhook and then fallback to polling.
+
+threading.Thread(target=poll_until_complete, args=(task["task_id"],), daemon=True).start()
+
+time.sleep(10)  # wait for webhook; if none arrives, polling thread fills `received`
+print("Final task state:", received)
+```
+
+In production, replace the simulated webhook handler with your framework's request object, respond with `200 OK` on successful verification, and rely on the polling loop only when callbacks do not arrive in time.
+
 ### Fetch results
 
 When the task is completed, the result can be fetched with the endpoint:
