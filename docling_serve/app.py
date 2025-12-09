@@ -83,6 +83,8 @@ from docling_serve.orchestrator_factory import get_async_orchestrator
 from docling_serve.response_preparation import prepare_response
 from docling_serve.settings import docling_serve_settings
 from docling_serve.storage import get_scratch
+from docling_serve.http_notifier import HttpNotifier
+from docling_serve.notifier import MultiNotifier
 from docling_serve.websocket_notifier import WebsocketNotifier
 
 
@@ -124,7 +126,11 @@ async def lifespan(app: FastAPI):
     scratch_dir = get_scratch()
 
     orchestrator = get_async_orchestrator()
-    notifier = WebsocketNotifier(orchestrator)
+    notifier = MultiNotifier(
+        orchestrator,
+        WebsocketNotifier(orchestrator),
+        HttpNotifier(orchestrator),
+    )
     orchestrator.bind_notifier(notifier)
 
     # Warm up processing cache
@@ -304,6 +310,13 @@ def create_app():  # noqa: C901
         )
         return override
 
+    def _register_webhook(
+        orchestrator: BaseOrchestrator, task_id: str, webhook_config: WebhookConfig | None
+    ) -> None:
+        notifier = getattr(orchestrator, "notifier", None)
+        if notifier and hasattr(notifier, "register_webhook"):
+            notifier.register_webhook(task_id, webhook_config)
+
     async def _enque_source(
         orchestrator: BaseOrchestrator,
         request: ConvertDocumentsRequest | GenericChunkDocumentsRequest,
@@ -335,6 +348,8 @@ def create_app():  # noqa: C901
         else:
             raise RuntimeError("Uknown request type.")
 
+        webhook_config = _resolve_webhook_config(webhook_override)
+
         task = await orchestrator.enqueue(
             task_type=task_type,
             sources=sources,
@@ -342,8 +357,9 @@ def create_app():  # noqa: C901
             chunking_options=chunking_options,
             chunking_export_options=chunking_export_options,
             target=request.target,
-            webhook_config=_resolve_webhook_config(webhook_override),
+            webhook_config=webhook_config,
         )
+        _register_webhook(orchestrator, task.task_id, webhook_config)
         return task
 
     async def _enque_file(
@@ -366,6 +382,8 @@ def create_app():  # noqa: C901
             name = file.filename if file.filename else f"file{suffix}.pdf"
             file_sources.append(DocumentStream(name=name, stream=buf))
 
+        webhook_config = _resolve_webhook_config(webhook_override)
+
         task = await orchestrator.enqueue(
             task_type=task_type,
             sources=file_sources,
@@ -373,8 +391,9 @@ def create_app():  # noqa: C901
             chunking_options=chunking_options,
             chunking_export_options=chunking_export_options,
             target=target,
-            webhook_config=_resolve_webhook_config(webhook_override),
+            webhook_config=webhook_config,
         )
+        _register_webhook(orchestrator, task.task_id, webhook_config)
         return task
 
     async def _wait_task_complete(orchestrator: BaseOrchestrator, task_id: str) -> bool:
@@ -938,7 +957,18 @@ def create_app():  # noqa: C901
                     detail="Api key is required as ?api_key=SECRET.",
                 )
 
-        assert isinstance(orchestrator.notifier, WebsocketNotifier)
+        notifier = getattr(orchestrator, "notifier", None)
+        websocket_notifier = None
+        if isinstance(notifier, WebsocketNotifier):
+            websocket_notifier = notifier
+        elif hasattr(notifier, "websocket_notifier"):
+            websocket_notifier = notifier.websocket_notifier
+
+        if websocket_notifier is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Websocket notifier is not configured.",
+            )
         await websocket.accept()
 
         try:
@@ -954,7 +984,7 @@ def create_app():  # noqa: C901
             return
 
         # Track active WebSocket connections for this job
-        orchestrator.notifier.task_subscribers[task_id].add(websocket)
+        websocket_notifier.task_subscribers[task_id].add(websocket)
 
         try:
             task_queue_position = await orchestrator.get_queue_position(task_id=task_id)
@@ -994,7 +1024,7 @@ def create_app():  # noqa: C901
             _log.info(f"WebSocket disconnected for job {task_id}")
 
         finally:
-            orchestrator.notifier.task_subscribers[task_id].remove(websocket)
+            websocket_notifier.task_subscribers[task_id].remove(websocket)
 
     # Task result
     @app.get(
